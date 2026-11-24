@@ -1,0 +1,126 @@
+name: Search delivery
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        options: [rehearsal, staging, production]
+        required: true
+        default: rehearsal
+      digest:
+        description: Published and tested image digest (required for staging and production)
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/pheerses/itmo-mlops-labs
+  HELM_DRIVER: configmap
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install -r requirements.txt
+          python scripts/build_index.py
+          python -m pytest -q
+          mkdir -p reports
+          cp artifacts/metadata.json reports/
+          python scripts/evaluate.py > reports/quality.json
+          if python scripts/evaluate.py --ranking-mode reverse > reports/reverse.json; then exit 1; fi
+          python -c "import json; r=json.load(open('reports/reverse.json')); assert r['mrr'] < .85 or r['recall_at_3'] < .90"
+          helm lint helm/mlops-search --set-string image.digest=sha256:$(printf '%064d' 0)
+          for digest in '' 'latest' 'sha256:1234'; do
+            if helm template check helm/mlops-search --set-string image.digest="$digest"; then exit 1; fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quality
+          path: reports/
+  image:
+    if: github.event_name != 'pull_request' && (inputs.target == '' || inputs.target == 'rehearsal')
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: publish
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+  rehearsal:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DIGEST: ${{ needs.image.outputs.digest }}
+      NS: default
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: delivery
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          kubectl create secret generic ghcr-pull --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson="$HOME/.docker/config.json"
+          kubectl patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+          bash scripts/deliver.sh staging
+          bash scripts/deliver.sh production
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rehearsal
+          path: reports/
+  course:
+    if: github.event_name == 'workflow_dispatch' && inputs.target != 'rehearsal' && github.ref == 'refs/heads/main'
+    needs: quality
+    concurrency: course-titovets-delivery
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target }}
+    env:
+      DIGEST: ${{ inputs.digest }}
+      NS: ${{ vars.KUBE_NAMESPACE }}
+      TARGET: ${{ inputs.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure course cluster
+        env:
+          CONFIG: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          umask 077
+          test -n "$NS"
+          printf '%s' "$CONFIG" | base64 -d > "$RUNNER_TEMP/course-config"
+          echo "KUBECONFIG=$RUNNER_TEMP/course-config" >> "$GITHUB_ENV"
+      - run: bash scripts/deliver.sh "$TARGET"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: course-${{ inputs.target }}
+          path: reports/

@@ -1,0 +1,8 @@
+*.kubeconfig
+.env*
+.venv/
+__pycache__/
+.pytest_cache/
+artifacts/
+reports/
+*.joblib
